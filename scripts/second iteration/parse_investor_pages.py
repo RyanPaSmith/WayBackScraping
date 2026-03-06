@@ -1,513 +1,717 @@
 """
-Parse downloaded investor pages to extract useful information
+Parse downloaded investor pages into:
+1. parsed_data       -> page-level metadata
+2. disclosure_items  -> repeated disclosure rows from index pages
+3. linked_targets    -> PDFs / detail pages to resolve and download
 """
+
+import csv
+import json
 import os
 import re
 import sqlite3
-from pathlib import Path
-from typing import Dict, List, Optional
-from bs4 import BeautifulSoup
 from datetime import datetime
+from typing import Optional
+from urllib.parse import urljoin
+
+from bs4 import BeautifulSoup
 
 
-def init_parsed_data_table(conn: sqlite3.Connection) -> None:
-    """Create table to store parsed information"""
+DATE_PATTERNS = [
+    "%B %d, %Y",
+    "%b %d, %Y",
+    "%B %d %Y",
+    "%b %d %Y",
+]
+
+PAGE_TYPE_HINTS = {
+    "earnings_index": ["earnings", "results.cfm", "quarterly-results", "financial-results", "results"],
+    "sec_index": ["sec-filings", "sec.cfm", "/sec/", "/filings"],
+    "press_index": ["press-release", "press-releases", "newsroom", "/news/", "/press/", "/pr/"],
+    "annual_reports_index": ["annual-report", "annual-reports", "proxy", "financial-history", "financials.cfm"],
+    "investor_home": ["investor-relations/default", "investor-relations/index", "/investor-relations/", "/investor/", "/investors/"],
+    "governance_index": ["governance", "leadership-and-governance", "corporate-governance"],
+    "esg_index": ["/esg/", "environment social governance", "sustainability", "responsibility"],
+}
+
+LINK_TYPE_HINTS = {
+    "earnings_release": ["results", "earnings", "quarterly results", "financial results"],
+    "sec_filing": ["10-k", "10-q", "8-k", "sec", "filing", "edgar"],
+    "annual_report": ["annual report", "proxy", "financial history"],
+    "presentation": ["presentation", "slides", "webcast"],
+    "press_release": ["press release", "news release", "announcement", "newsroom"],
+    "esg_doc": ["esg", "sustainability", "responsibility"],
+}
+
+HIGH_VALUE_LINK_HINTS = [
+    "download",
+    ".pdf",
+    "results",
+    "earnings",
+    "annual report",
+    "proxy",
+    "presentation",
+    "release",
+    "10-k",
+    "10-q",
+    "8-k",
+]
+
+
+def init_tables(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
-    
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS parsed_data (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            capture_id INTEGER NOT NULL,
-            
-            -- Extracted information
+            capture_id INTEGER NOT NULL UNIQUE,
+
             page_title TEXT,
-            page_type TEXT,  -- 'investor_home', 'sec_filing', 'earnings', 'presentation', etc.
-            
-            -- Links found
-            links_json TEXT,  -- JSON array of {url, text, type}
-            
-            -- Documents mentioned
-            document_links_json TEXT,  -- JSON array of PDF/doc links
-            
-            -- Text content
+            page_type TEXT,
+            page_class TEXT,
+
+            links_json TEXT,
+            priority_links_json TEXT,
             main_text TEXT,
-            
-            -- Metadata
-            has_financial_data BOOLEAN,
-            has_sec_filings BOOLEAN,
-            has_earnings_info BOOLEAN,
-            has_presentations BOOLEAN,
-            
-            -- Timestamps
+
+            item_count INTEGER DEFAULT 0,
             parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            
-            FOREIGN KEY (capture_id) REFERENCES captures(id),
-            UNIQUE(capture_id)
+
+            FOREIGN KEY (capture_id) REFERENCES captures(id)
         );
     """)
-    
+
     cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_parsed_capture 
+        CREATE INDEX IF NOT EXISTS idx_parsed_capture_id
         ON parsed_data(capture_id);
     """)
-    
+
     cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_page_type 
+        CREATE INDEX IF NOT EXISTS idx_parsed_page_type
         ON parsed_data(page_type);
     """)
-    
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_parsed_page_class
+        ON parsed_data(page_class);
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS disclosure_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            capture_id INTEGER NOT NULL,
+            firm TEXT NOT NULL,
+            snapshot_year INTEGER NOT NULL,
+
+            page_type TEXT,
+            item_date TEXT,
+            item_date_raw TEXT,
+            headline TEXT,
+            linked_url TEXT,
+            source_page_url TEXT,
+
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+            UNIQUE (capture_id, item_date_raw, headline, linked_url),
+            FOREIGN KEY (capture_id) REFERENCES captures(id)
+        );
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_disclosure_items_capture_id
+        ON disclosure_items(capture_id);
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_disclosure_items_year
+        ON disclosure_items(snapshot_year);
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS linked_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            source_capture_id INTEGER NOT NULL,
+            snapshot_year INTEGER NOT NULL,
+
+            target_url TEXT NOT NULL,
+            link_text TEXT,
+            inferred_type TEXT,
+            wants_download INTEGER NOT NULL DEFAULT 1,
+
+            status TEXT NOT NULL DEFAULT 'pending',
+            capture_id INTEGER,
+            resolved_wayback_timestamp TEXT,
+            error_message TEXT,
+
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+            UNIQUE (source_capture_id, target_url),
+            FOREIGN KEY (source_capture_id) REFERENCES captures(id),
+            FOREIGN KEY (capture_id) REFERENCES captures(id)
+        );
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_linked_targets_status
+        ON linked_targets(status);
+    """)
+
     conn.commit()
 
 
-def classify_page_type(url: str, title: str, text: str) -> str:
-    """Classify what type of investor page this is"""
-    url_lower = url.lower()
-    title_lower = title.lower() if title else ""
-    text_lower = text.lower()[:2000]  # Check first 2000 chars
-    
-    # Check for specific page types
-    if any(x in url_lower for x in ['sec-filing', '/sec/', '/filings']):
-        return 'sec_filings'
-    
-    if any(x in url_lower for x in ['10-k', '10-q', '8-k']):
-        return 'sec_filing_detail'
-    
-    if any(x in url_lower for x in ['earnings', 'quarterly-results', 'financial-results']):
-        return 'earnings'
-    
-    if any(x in url_lower for x in ['presentation', 'presentations', 'events']):
-        return 'presentations'
-    
-    if any(x in url_lower for x in ['annual-report', 'annualreport']):
-        return 'annual_report'
-    
-    if any(x in url_lower for x in ['press-release', 'news', 'newsroom']):
-        return 'press'
-    
-    if any(x in url_lower for x in ['shareholder', 'stockholder']):
-        return 'shareholder_info'
-    
-    if any(x in url_lower for x in ['stock-price', 'stock-quote', 'quote']):
-        return 'stock_info'
-    
-    # Check for IR home page indicators
-    if 'investor' in url_lower and url_lower.endswith(('/', '/default.html', '/index.html')):
-        return 'investor_home'
-    
-    return 'other'
+def normalize_whitespace(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "")).strip()
 
 
-def extract_links(soup: BeautifulSoup, base_url: str) -> Dict[str, List[Dict]]:
-    """Extract and categorize all links from the page"""
-    
-    links = {
-        'sec_filings': [],
-        'presentations': [],
-        'earnings': [],
-        'annual_reports': [],
-        'press_releases': [],
-        'documents': [],  # PDFs, docs, etc.
-        'other': []
-    }
-    
-    for a in soup.find_all('a', href=True):
-        href = a['href'].strip()
-        text = a.get_text(strip=True)
-        
-        if not href or href.startswith(('#', 'javascript:', 'mailto:')):
+def parse_date_from_text(text: str) -> tuple[Optional[str], Optional[str]]:
+    if not text:
+        return None, None
+
+    text = normalize_whitespace(text)
+
+    date_regexes = [
+        r"([A-Z][a-z]+ \d{1,2}, \d{4})",
+        r"([A-Z][a-z]{2} \d{1,2}, \d{4})",
+        r"([A-Z][a-z]+ \d{1,2} \d{4})",
+        r"([A-Z][a-z]{2} \d{1,2} \d{4})",
+    ]
+
+    for regex in date_regexes:
+        match = re.search(regex, text)
+        if not match:
             continue
-        
-        # Make absolute URLs (simple version)
-        if href.startswith('http'):
-            url = href
-        elif href.startswith('/'):
-            # Extract domain from base_url
-            match = re.match(r'(https?://[^/]+)', base_url)
-            domain = match.group(1) if match else ''
-            url = domain + href
-        else:
-            url = href  # Relative URL
-        
-        link_data = {
-            'url': url,
-            'text': text,
-            'href': href
-        }
-        
-        # Categorize the link
-        href_lower = href.lower()
-        text_lower = text.lower()
-        
-        # Document links (PDFs, DOCs, etc.)
-        if any(href_lower.endswith(ext) for ext in ['.pdf', '.doc', '.docx', '.xls', '.xlsx']):
-            links['documents'].append(link_data)
-            continue
-        
-        # SEC filings
-        if any(x in href_lower or x in text_lower for x in ['10-k', '10-q', '8-k', 'sec', 'filing']):
-            links['sec_filings'].append(link_data)
-        
-        # Presentations
-        elif any(x in href_lower or x in text_lower for x in ['presentation', 'webcast', 'conference-call', 'event']):
-            links['presentations'].append(link_data)
-        
-        # Earnings
-        elif any(x in href_lower or x in text_lower for x in ['earnings', 'quarterly-result', 'financial-result']):
-            links['earnings'].append(link_data)
-        
-        # Annual reports
-        elif any(x in href_lower or x in text_lower for x in ['annual-report', 'proxy']):
-            links['annual_reports'].append(link_data)
-        
-        # Press releases
-        elif any(x in href_lower or x in text_lower for x in ['press', 'news-release', 'announcement']):
-            links['press_releases'].append(link_data)
-        
-        else:
-            links['other'].append(link_data)
-    
-    return links
+
+        raw_date = match.group(1).strip()
+
+        for date_format in DATE_PATTERNS:
+            try:
+                parsed = datetime.strptime(raw_date, date_format).strftime("%Y-%m-%d")
+                return raw_date, parsed
+            except ValueError:
+                continue
+
+    return None, None
+
+
+def infer_page_type(url: str, title: str, text: str) -> str:
+    lower_url = (url or "").lower()
+    lower_title = (title or "").lower()
+    lower_text = (text or "").lower()[:2000]
+    combined = f"{lower_url} {lower_title} {lower_text}"
+
+    for page_type, hints in PAGE_TYPE_HINTS.items():
+        if any(hint in combined for hint in hints):
+            return page_type
+
+    if "10-k" in combined or "10-q" in combined or "8-k" in combined:
+        return "sec_detail"
+
+    return "other"
+
+
+def infer_link_type(url: str, text: str) -> str:
+    combined = f"{(url or '').lower()} {(text or '').lower()}"
+
+    for link_type, hints in LINK_TYPE_HINTS.items():
+        if any(hint in combined for hint in hints):
+            return link_type
+
+    if ".pdf" in combined or "download" in combined:
+        return "document"
+
+    return "other"
+
+
+def is_document_url(url: str) -> bool:
+    lower_url = (url or "").lower()
+    return any(lower_url.endswith(ext) for ext in [".pdf", ".doc", ".docx", ".xls", ".xlsx"]) or "download" in lower_url
+
+
+def should_queue_link(url: str, text: str) -> bool:
+    combined = f"{(url or '').lower()} {(text or '').lower()}"
+    return any(hint in combined for hint in HIGH_VALUE_LINK_HINTS)
 
 
 def extract_main_text(soup: BeautifulSoup) -> str:
-    """Extract the main text content from the page"""
-    
-    # Remove script and style elements
-    for element in soup(['script', 'style', 'nav', 'header', 'footer']):
-        element.decompose()
-    
-    # Get text
-    text = soup.get_text(separator='\n', strip=True)
-    
-    # Clean up whitespace
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    text = '\n'.join(lines)
-    
-    return text
+    working_soup = BeautifulSoup(str(soup), "html.parser")
+
+    for tag in working_soup(["script", "style", "noscript", "header", "footer"]):
+        tag.decompose()
+
+    text = working_soup.get_text(separator="\n", strip=True)
+    lines = [normalize_whitespace(line) for line in text.split("\n")]
+    lines = [line for line in lines if line]
+    return "\n".join(lines)
 
 
-def check_content_flags(text: str, links: Dict) -> Dict[str, bool]:
-    """Check for presence of different types of investor information"""
-    text_lower = text.lower()
-    
-    return {
-        'has_financial_data': any(x in text_lower for x in [
-            'revenue', 'earnings', 'eps', 'net income', 'gross margin',
-            'operating income', 'cash flow', 'balance sheet'
-        ]),
-        'has_sec_filings': len(links['sec_filings']) > 0 or any(x in text_lower for x in [
-            '10-k', '10-q', '8-k', 'sec filing', 'edgar'
-        ]),
-        'has_earnings_info': len(links['earnings']) > 0 or any(x in text_lower for x in [
-            'quarterly results', 'earnings report', 'earnings call'
-        ]),
-        'has_presentations': len(links['presentations']) > 0 or 'presentation' in text_lower
-    }
+def extract_all_links(soup: BeautifulSoup, base_url: str) -> list[dict]:
+    links = []
+
+    for anchor in soup.find_all("a", href=True):
+        href = normalize_whitespace(anchor.get("href", ""))
+        text = normalize_whitespace(anchor.get_text(" ", strip=True))
+
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+
+        absolute_url = urljoin(base_url, href)
+        link_type = infer_link_type(absolute_url, text)
+
+        links.append({
+            "url": absolute_url,
+            "text": text,
+            "href": href,
+            "link_type": link_type,
+            "is_document": is_document_url(absolute_url),
+        })
+
+    deduped = []
+    seen = set()
+
+    for link in links:
+        key = (link["url"], link["text"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(link)
+
+    return deduped
 
 
-def parse_html_file(file_path: str, url: str) -> Dict:
-    """Parse a single HTML file and extract investor information"""
-    
+def extract_priority_links(all_links: list[dict]) -> list[dict]:
+    return [link for link in all_links if should_queue_link(link["url"], link["text"])]
+
+
+def extract_disclosure_items(soup: BeautifulSoup, base_url: str, page_type: str) -> list[dict]:
+    items = []
+
+    candidate_tags = soup.find_all(["li", "tr", "p", "div"])
+
+    for tag in candidate_tags:
+        row_text = normalize_whitespace(tag.get_text(" ", strip=True))
+        if len(row_text) < 12:
+            continue
+
+        raw_date, normalized_date = parse_date_from_text(row_text)
+        if not raw_date:
+            continue
+
+        anchor = tag.find("a", href=True)
+        if not anchor:
+            continue
+
+        href = normalize_whitespace(anchor.get("href", ""))
+        headline = normalize_whitespace(anchor.get_text(" ", strip=True))
+        if not headline:
+            continue
+
+        linked_url = urljoin(base_url, href)
+
+        items.append({
+            "page_type": page_type,
+            "item_date": normalized_date,
+            "item_date_raw": raw_date,
+            "headline": headline,
+            "linked_url": linked_url,
+        })
+
+    deduped = []
+    seen = set()
+
+    for item in items:
+        key = (item["item_date_raw"], item["headline"], item["linked_url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+
+    return deduped
+
+
+def classify_page_class(page_type: str, disclosure_items: list[dict], all_links: list[dict], main_text: str) -> str:
+    if disclosure_items and len(disclosure_items) >= 2:
+        return "index_page"
+
+    if page_type in {"earnings_index", "sec_index", "press_index", "annual_reports_index"} and len(all_links) >= 5:
+        return "index_page"
+
+    if len(main_text) > 1200 and len(disclosure_items) <= 1:
+        return "detail_page"
+
+    if page_type in {"investor_home", "governance_index", "esg_index"}:
+        return "nav_page"
+
+    return "nav_page"
+
+
+def parse_html_file(file_path: str, url: str) -> dict:
     try:
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            html_content = f.read()
-    except Exception as e:
-        return {'error': f"Failed to read file: {e}"}
-    
-    # Parse with BeautifulSoup
-    soup = BeautifulSoup(html_content, 'html.parser')
-    
-    # Extract page title
-    title_tag = soup.find('title')
-    page_title = title_tag.get_text(strip=True) if title_tag else ''
-    
-    # Extract main text
+        with open(file_path, "r", encoding="utf-8", errors="replace") as file_handle:
+            html = file_handle.read()
+    except Exception as exc:
+        return {"error": f"Failed to read HTML file: {exc}"}
+
+    soup = BeautifulSoup(html, "html.parser")
+    title_tag = soup.find("title")
+    page_title = normalize_whitespace(title_tag.get_text(" ", strip=True)) if title_tag else ""
+
     main_text = extract_main_text(soup)
-    
-    # Extract links
-    links = extract_links(soup, url)
-    
-    # Classify page type
-    page_type = classify_page_type(url, page_title, main_text)
-    
-    # Check for content flags
-    content_flags = check_content_flags(main_text, links)
-    
+    page_type = infer_page_type(url, page_title, main_text)
+    all_links = extract_all_links(soup, url)
+    priority_links = extract_priority_links(all_links)
+    disclosure_items = extract_disclosure_items(soup, url, page_type)
+    page_class = classify_page_class(page_type, disclosure_items, all_links, main_text)
+
     return {
-        'page_title': page_title,
-        'page_type': page_type,
-        'main_text': main_text[:10000],  # Limit to 10k chars for storage
-        'links': links,
-        'content_flags': content_flags,
-        'error': None
+        "error": None,
+        "page_title": page_title,
+        "page_type": page_type,
+        "page_class": page_class,
+        "main_text": main_text[:15000],
+        "all_links": all_links,
+        "priority_links": priority_links,
+        "disclosure_items": disclosure_items,
     }
 
 
-def parse_all_downloaded_captures(db_path: str, downloads_dir: str) -> None:
-    """Parse all downloaded HTML files and store results"""
-    
+def insert_parsed_pdf_stub(cur: sqlite3.Cursor, capture_row: sqlite3.Row) -> None:
+    page_type = "document_pdf"
+    lower_page_key = (capture_row["page_key"] or "").lower()
+
+    if "earnings" in lower_page_key:
+        page_type = "earnings_document"
+    elif "sec" in lower_page_key:
+        page_type = "sec_document"
+    elif "annual" in lower_page_key:
+        page_type = "annual_report_document"
+    elif "presentation" in lower_page_key:
+        page_type = "presentation_document"
+
+    cur.execute("""
+        INSERT OR IGNORE INTO parsed_data (
+            capture_id, page_title, page_type, page_class,
+            links_json, priority_links_json, main_text, item_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        capture_row["id"],
+        os.path.basename(capture_row["local_path"] or capture_row["url"]),
+        page_type,
+        "detail_page",
+        "[]",
+        "[]",
+        None,
+        0,
+    ))
+
+
+def insert_disclosure_items(
+    cur: sqlite3.Cursor,
+    capture_row: sqlite3.Row,
+    items: list[dict]
+) -> None:
+    for item in items:
+        cur.execute("""
+            INSERT OR IGNORE INTO disclosure_items (
+                capture_id, firm, snapshot_year, page_type,
+                item_date, item_date_raw, headline, linked_url, source_page_url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            capture_row["id"],
+            capture_row["firm"],
+            capture_row["snapshot_year"],
+            item["page_type"],
+            item["item_date"],
+            item["item_date_raw"],
+            item["headline"],
+            item["linked_url"],
+            capture_row["url"],
+        ))
+
+
+def insert_linked_targets(
+    cur: sqlite3.Cursor,
+    capture_row: sqlite3.Row,
+    priority_links: list[dict],
+    disclosure_items: list[dict]
+) -> None:
+    queued_urls = set()
+
+    for link in priority_links:
+        if not link["url"]:
+            continue
+        queued_urls.add((link["url"], link["text"], link["link_type"]))
+
+    for item in disclosure_items:
+        if item["linked_url"]:
+            queued_urls.add((item["linked_url"], item["headline"], item["page_type"]))
+
+    for target_url, link_text, inferred_type in queued_urls:
+        cur.execute("""
+            INSERT OR IGNORE INTO linked_targets (
+                source_capture_id, snapshot_year, target_url, link_text, inferred_type, wants_download, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            capture_row["id"],
+            capture_row["snapshot_year"],
+            target_url,
+            link_text,
+            inferred_type,
+            1,
+            "pending",
+        ))
+
+
+def parse_all_downloaded_captures(db_path: str) -> None:
     conn = sqlite3.connect(db_path, timeout=60)
     conn.row_factory = sqlite3.Row
-    
+
     try:
-        init_parsed_data_table(conn)
+        init_tables(conn)
         cur = conn.cursor()
-        
-        # Get all downloaded captures
+
         cur.execute("""
-            SELECT id, url, local_path, snapshot_year, mime_type
+            SELECT *
             FROM captures
             WHERE fetch_status = 'downloaded'
-            AND local_path IS NOT NULL
+              AND local_path IS NOT NULL
+              AND id NOT IN (SELECT capture_id FROM parsed_data)
+            ORDER BY snapshot_year, source_type, id
         """)
-        
+
         captures = cur.fetchall()
-        
         if not captures:
-            print("No downloaded captures to parse")
+            print("No new downloaded captures to parse")
             return
-        
-        print(f"\nParsing {len(captures)} downloaded files...")
-        
-        for i, capture in enumerate(captures, 1):
-            capture_id = capture['id']
-            url = capture['url']
-            local_path = capture['local_path']
-            year = capture['snapshot_year']
-            mime_type = capture['mime_type'] or ''
-            
-            print(f"\n[{i}/{len(captures)}] Parsing capture {capture_id}")
-            print(f"  File: {os.path.basename(local_path)}")
-            
-            # Check if already parsed
-            cur.execute("SELECT id FROM parsed_data WHERE capture_id = ?", (capture_id,))
-            if cur.fetchone():
-                print("  ⊘ Already parsed, skipping")
+
+        print(f"\nParsing {len(captures)} downloaded captures...")
+
+        for index, capture in enumerate(captures, 1):
+            print(f"\n[{index}/{len(captures)}] Capture {capture['id']}")
+            print(f"  Source type: {capture['source_type']}")
+            print(f"  URL: {capture['url']}")
+
+            local_path = capture["local_path"]
+            mime_type = (capture["mime_type"] or "").lower()
+
+            if not local_path or not os.path.exists(local_path):
+                print("  ✗ File missing; skipping")
                 continue
-            
-            # Skip PDFs for now (need different parsing)
-            if 'pdf' in mime_type.lower() or local_path.endswith('.pdf'):
-                print("  ⊘ PDF file - skipping for now")
+
+            if "pdf" in mime_type or local_path.lower().endswith(".pdf"):
+                insert_parsed_pdf_stub(cur, capture)
+                conn.commit()
+                print("  ✓ Registered PDF stub in parsed_data")
                 continue
-            
-            # Check file exists
-            if not os.path.exists(local_path):
-                print(f"  ✗ File not found: {local_path}")
-                continue
-            
-            # Parse HTML
-            result = parse_html_file(local_path, url)
-            
-            if result.get('error'):
+
+            result = parse_html_file(local_path, capture["url"])
+            if result["error"]:
                 print(f"  ✗ Parse error: {result['error']}")
                 continue
-            
-            # Store results
-            import json
-            
-            # Combine all links into a single JSON structure
-            all_links = []
-            for category, link_list in result['links'].items():
-                for link in link_list:
-                    all_links.append({
-                        'category': category,
-                        **link
-                    })
-            
-            # Extract just document links
-            doc_links = result['links']['documents']
-            
+
             cur.execute("""
-                INSERT INTO parsed_data (
-                    capture_id, page_title, page_type, links_json, 
-                    document_links_json, main_text, has_financial_data,
-                    has_sec_filings, has_earnings_info, has_presentations
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO parsed_data (
+                    capture_id, page_title, page_type, page_class,
+                    links_json, priority_links_json, main_text, item_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                capture_id,
-                result['page_title'],
-                result['page_type'],
-                json.dumps(all_links, indent=2),
-                json.dumps(doc_links, indent=2),
-                result['main_text'],
-                result['content_flags']['has_financial_data'],
-                result['content_flags']['has_sec_filings'],
-                result['content_flags']['has_earnings_info'],
-                result['content_flags']['has_presentations']
+                capture["id"],
+                result["page_title"],
+                result["page_type"],
+                result["page_class"],
+                json.dumps(result["all_links"], indent=2),
+                json.dumps(result["priority_links"], indent=2),
+                result["main_text"],
+                len(result["disclosure_items"]),
             ))
-            
+
+            insert_disclosure_items(cur, capture, result["disclosure_items"])
+            insert_linked_targets(cur, capture, result["priority_links"], result["disclosure_items"])
+
             conn.commit()
-            
-            print(f"  ✓ Parsed successfully")
-            print(f"    Title: {result['page_title'][:60]}")
-            print(f"    Type: {result['page_type']}")
-            print(f"    Links: {len(all_links)} total")
-            print(f"    Documents: {len(doc_links)} PDFs/docs")
-            print(f"    Flags: financial={result['content_flags']['has_financial_data']}, "
-                  f"sec={result['content_flags']['has_sec_filings']}, "
-                  f"earnings={result['content_flags']['has_earnings_info']}")
-        
-        print(f"\n✓ Parsing complete!")
-        
+
+            print(f"  ✓ Parsed page")
+            print(f"    Title: {result['page_title'][:80]}")
+            print(f"    Page type: {result['page_type']}")
+            print(f"    Page class: {result['page_class']}")
+            print(f"    Disclosure items: {len(result['disclosure_items'])}")
+            print(f"    Priority links queued: {len(result['priority_links'])}")
+
     finally:
         conn.close()
 
 
 def generate_summary_report(db_path: str, output_file: str = "parsing_summary.txt") -> None:
-    """Generate a summary report of parsed data"""
-    
     conn = sqlite3.connect(db_path, timeout=60)
     conn.row_factory = sqlite3.Row
-    
+
     try:
         cur = conn.cursor()
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write("=" * 80 + "\n")
-            f.write("INVESTOR PAGE PARSING SUMMARY\n")
-            f.write("=" * 80 + "\n\n")
-            
-            # Overall stats
-            cur.execute("SELECT COUNT(*) as cnt FROM parsed_data")
-            total = cur.fetchone()['cnt']
-            f.write(f"Total pages parsed: {total}\n\n")
-            
-            # By page type
-            f.write("Pages by Type:\n")
-            f.write("-" * 40 + "\n")
+
+        with open(output_file, "w", encoding="utf-8") as file_handle:
+            file_handle.write("=" * 80 + "\n")
+            file_handle.write("INVESTOR DISCLOSURE PIPELINE SUMMARY\n")
+            file_handle.write("=" * 80 + "\n\n")
+
+            cur.execute("SELECT COUNT(*) AS cnt FROM parsed_data")
+            file_handle.write(f"Parsed pages: {cur.fetchone()['cnt']}\n")
+
+            cur.execute("SELECT COUNT(*) AS cnt FROM disclosure_items")
+            file_handle.write(f"Disclosure items extracted: {cur.fetchone()['cnt']}\n")
+
+            cur.execute("SELECT COUNT(*) AS cnt FROM linked_targets")
+            file_handle.write(f"Linked targets queued: {cur.fetchone()['cnt']}\n\n")
+
+            file_handle.write("Parsed pages by class:\n")
+            file_handle.write("-" * 40 + "\n")
             cur.execute("""
-                SELECT page_type, COUNT(*) as cnt 
-                FROM parsed_data 
-                GROUP BY page_type 
+                SELECT page_class, COUNT(*) AS cnt
+                FROM parsed_data
+                GROUP BY page_class
                 ORDER BY cnt DESC
             """)
             for row in cur.fetchall():
-                f.write(f"  {row['page_type']:20s}: {row['cnt']:3d}\n")
-            
-            # Content flags
-            f.write("\nContent Analysis:\n")
-            f.write("-" * 40 + "\n")
-            cur.execute("SELECT COUNT(*) as cnt FROM parsed_data WHERE has_financial_data = 1")
-            f.write(f"  Has financial data:  {cur.fetchone()['cnt']}\n")
-            
-            cur.execute("SELECT COUNT(*) as cnt FROM parsed_data WHERE has_sec_filings = 1")
-            f.write(f"  Has SEC filings:     {cur.fetchone()['cnt']}\n")
-            
-            cur.execute("SELECT COUNT(*) as cnt FROM parsed_data WHERE has_earnings_info = 1")
-            f.write(f"  Has earnings info:   {cur.fetchone()['cnt']}\n")
-            
-            cur.execute("SELECT COUNT(*) as cnt FROM parsed_data WHERE has_presentations = 1")
-            f.write(f"  Has presentations:   {cur.fetchone()['cnt']}\n")
-            
-            # Detailed page list
-            f.write("\n" + "=" * 80 + "\n")
-            f.write("DETAILED PAGE LIST\n")
-            f.write("=" * 80 + "\n\n")
-            
+                file_handle.write(f"  {row['page_class']:20s}: {row['cnt']:3d}\n")
+
+            file_handle.write("\nParsed pages by type:\n")
+            file_handle.write("-" * 40 + "\n")
             cur.execute("""
-                SELECT 
-                    c.snapshot_year,
-                    c.url,
-                    p.page_title,
-                    p.page_type,
-                    p.has_financial_data,
-                    p.has_sec_filings,
-                    p.has_earnings_info
-                FROM parsed_data p
-                JOIN captures c ON p.capture_id = c.id
-                ORDER BY c.snapshot_year, p.page_type
+                SELECT page_type, COUNT(*) AS cnt
+                FROM parsed_data
+                GROUP BY page_type
+                ORDER BY cnt DESC
             """)
-            
             for row in cur.fetchall():
-                f.write(f"{row['snapshot_year']} | {row['page_type']:20s}\n")
-                f.write(f"  Title: {row['page_title']}\n")
-                f.write(f"  URL:   {row['url']}\n")
-                flags = []
-                if row['has_financial_data']:
-                    flags.append('financial')
-                if row['has_sec_filings']:
-                    flags.append('sec')
-                if row['has_earnings_info']:
-                    flags.append('earnings')
-                if flags:
-                    f.write(f"  Flags: {', '.join(flags)}\n")
-                f.write("\n")
-        
-        print(f"\n✓ Summary report written to: {output_file}")
-        
+                file_handle.write(f"  {row['page_type']:25s}: {row['cnt']:3d}\n")
+
+            file_handle.write("\nLinked target status:\n")
+            file_handle.write("-" * 40 + "\n")
+            cur.execute("""
+                SELECT status, COUNT(*) AS cnt
+                FROM linked_targets
+                GROUP BY status
+                ORDER BY cnt DESC
+            """)
+            for row in cur.fetchall():
+                file_handle.write(f"  {row['status']:20s}: {row['cnt']:3d}\n")
+
     finally:
         conn.close()
 
+    print(f"\n✓ Summary report written to {output_file}")
 
-def export_links_to_csv(db_path: str, output_file: str = "extracted_links.csv") -> None:
-    """Export all extracted links to a CSV file"""
-    import csv
-    import json
-    
+
+def export_disclosure_items_to_csv(db_path: str, output_file: str = "disclosure_items.csv") -> None:
     conn = sqlite3.connect(db_path, timeout=60)
     conn.row_factory = sqlite3.Row
-    
+
     try:
         cur = conn.cursor()
-        
         cur.execute("""
-            SELECT 
-                c.firm,
-                c.snapshot_year,
-                c.url as source_url,
-                p.page_type,
-                p.links_json
-            FROM parsed_data p
-            JOIN captures c ON p.capture_id = c.id
-            WHERE p.links_json IS NOT NULL
+            SELECT
+                firm,
+                snapshot_year,
+                page_type,
+                item_date,
+                item_date_raw,
+                headline,
+                linked_url,
+                source_page_url
+            FROM disclosure_items
+            ORDER BY snapshot_year, item_date, headline
         """)
-        
-        with open(output_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Firm', 'Year', 'Source_URL', 'Page_Type', 
-                           'Link_Category', 'Link_URL', 'Link_Text'])
-            
+
+        with open(output_file, "w", newline="", encoding="utf-8") as file_handle:
+            writer = csv.writer(file_handle)
+            writer.writerow([
+                "Firm",
+                "Snapshot_Year",
+                "Page_Type",
+                "Item_Date",
+                "Item_Date_Raw",
+                "Headline",
+                "Linked_URL",
+                "Source_Page_URL",
+            ])
+
             for row in cur.fetchall():
-                links = json.loads(row['links_json'])
-                
-                for link in links:
-                    writer.writerow([
-                        row['firm'],
-                        row['snapshot_year'],
-                        row['source_url'],
-                        row['page_type'],
-                        link.get('category', ''),
-                        link.get('url', ''),
-                        link.get('text', '')[:100]  # Truncate long text
-                    ])
-        
-        print(f"\n✓ Links exported to: {output_file}")
-        
+                writer.writerow([
+                    row["firm"],
+                    row["snapshot_year"],
+                    row["page_type"],
+                    row["item_date"],
+                    row["item_date_raw"],
+                    row["headline"],
+                    row["linked_url"],
+                    row["source_page_url"],
+                ])
+
     finally:
         conn.close()
+
+    print(f"✓ Disclosure items exported to {output_file}")
+
+
+def export_linked_targets_to_csv(db_path: str, output_file: str = "linked_targets.csv") -> None:
+    conn = sqlite3.connect(db_path, timeout=60)
+    conn.row_factory = sqlite3.Row
+
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                lt.snapshot_year,
+                c.firm,
+                lt.target_url,
+                lt.link_text,
+                lt.inferred_type,
+                lt.status,
+                lt.capture_id
+            FROM linked_targets lt
+            JOIN captures c ON lt.source_capture_id = c.id
+            ORDER BY lt.snapshot_year, lt.id
+        """)
+
+        with open(output_file, "w", newline="", encoding="utf-8") as file_handle:
+            writer = csv.writer(file_handle)
+            writer.writerow([
+                "Snapshot_Year",
+                "Firm",
+                "Target_URL",
+                "Link_Text",
+                "Inferred_Type",
+                "Status",
+                "Capture_ID",
+            ])
+
+            for row in cur.fetchall():
+                writer.writerow([
+                    row["snapshot_year"],
+                    row["firm"],
+                    row["target_url"],
+                    row["link_text"],
+                    row["inferred_type"],
+                    row["status"],
+                    row["capture_id"],
+                ])
+
+    finally:
+        conn.close()
+
+    print(f"✓ Linked targets exported to {output_file}")
 
 
 if __name__ == "__main__":
     DB_PATH = "apple_investor_pages.db"
-    DOWNLOADS_DIR = "downloads"
-    
-    print("="*60)
-    print("Parsing Downloaded Investor Pages")
-    print("="*60)
-    
-    # Parse all downloaded HTML files
-    parse_all_downloaded_captures(DB_PATH, DOWNLOADS_DIR)
-    
-    # Generate summary report
+
+    print("=" * 70)
+    print("PARSING DOWNLOADED INVESTOR CAPTURES")
+    print("=" * 70)
+
+    parse_all_downloaded_captures(DB_PATH)
     generate_summary_report(DB_PATH, "parsing_summary.txt")
-    
-    # Export links to CSV
-    export_links_to_csv(DB_PATH, "extracted_links.csv")
-    
-    print("\n" + "="*60)
-    print("✓ All parsing complete!")
-    print("="*60)
-    print("\nGenerated files:")
-    print("  - parsing_summary.txt   (overview of parsed content)")
-    print("  - extracted_links.csv   (all links found on pages)")
-    print("  - Database updated with parsed_data table")
+    export_disclosure_items_to_csv(DB_PATH, "disclosure_items.csv")
+    export_linked_targets_to_csv(DB_PATH, "linked_targets.csv")
+
+    print("\n✓ Parsing stage complete")
