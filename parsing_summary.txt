@@ -1,0 +1,34 @@
+================================================================================
+INVESTOR PAGE PARSING SUMMARY
+================================================================================
+
+Total pages parsed: 3
+
+Pages by Type:
+----------------------------------------
+  other               :   2
+  shareholder_info    :   1
+
+Content Analysis:
+----------------------------------------
+  Has financial data:  0
+  Has SEC filings:     0
+  Has earnings info:   0
+  Has presentations:   0
+
+================================================================================
+DETAILED PAGE LIST
+================================================================================
+
+2010 | other               
+  Title: Apple - Investor Relations
+  URL:   http://www.apple.com:80/investor
+
+2010 | other               
+  Title: Apple - Investor Relations
+  URL:   http://www.apple.com:80/investor/home.html
+
+2010 | shareholder_info    
+  Title: Apple Investor Relations: Shareholder Meetings
+  URL:   http://www.apple.com:80/investor/shareholder.html
+
